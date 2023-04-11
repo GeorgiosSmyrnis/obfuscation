@@ -435,8 +435,16 @@ class DiffusionEmbeddingMapper(EmbeddingMapper):
         final_activation=None
     )
 
+    self.encoder_prior = MLPEmbeddingMapper(
+        embed_dim,
+        latent_dim,
+        encoder_mlp_sizes,
+        weight_decay,
+        final_activation=None
+    )
+
     self.decoder = MLPEmbeddingMapper(
-        latent_dim+1,
+        2*latent_dim+1,
         embed_dim,
         decoder_mlp_sizes,
         weight_decay,
@@ -457,7 +465,7 @@ class DiffusionEmbeddingMapper(EmbeddingMapper):
 
     self.num_points = num_points
 
-  def _noise_prediction(self, inputs: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+  def _noise_prediction(self, inputs: torch.Tensor, clean_prior: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """Predict the noise to add to the input at a given timestep.
 
     Args:
@@ -467,15 +475,16 @@ class DiffusionEmbeddingMapper(EmbeddingMapper):
     Returns:
       The noise prediction for the input at the given timestep.
     """
-    x = self.encoder(inputs)
-    x = torch.cat([x, t], dim=-1)
+    x1 = self.encoder(inputs)
+    x2 = self.encoder_prior(clean_prior)
+    x = torch.cat([x1, x2, t], dim=-1)
     x = self.decoder(x)
     return x
 
-  def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # pytype: disable=signature-mismatch
+  def forward(self, inputs: torch.Tensor, prior: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # pytype: disable=signature-mismatch
 
     multiple_inputs = torch.tile(inputs, (self.num_points, 1))
-
+    
     t = torch.randint_like(multiple_inputs[..., [-1]], low=0, high=self.total_time, dtype=torch.int64)
     noise = torch.randn_like(multiple_inputs)
 
@@ -487,30 +496,30 @@ class DiffusionEmbeddingMapper(EmbeddingMapper):
     
     noisy_image = noisy_image_1 + noisy_image_2
 
-    return self._noise_prediction(noisy_image, t.float() / self.total_time), noise
+    return self._noise_prediction(noisy_image, prior, t.float() / self.total_time), noise
 
 
-  def get_sample(self, embedding_prior: torch.Tensor, training: bool = False) -> torch.Tensor:
+  def get_sample(self, obfuscated_prior: torch.Tensor, clean_prior: torch.Tensor, training: bool = False) -> torch.Tensor:
     if training:
-      return self._get_sample_train(embedding_prior)
+      return self._get_sample_train(obfuscated_prior, clean_prior)
     else:
-      return self._get_sample_eval(embedding_prior)
+      return self._get_sample_eval(obfuscated_prior, clean_prior)
 
-  def _get_sample_train(self, embedding_prior: torch.Tensor) -> torch.Tensor:
-    result = torch.randn_like(embedding_prior) + embedding_prior
+  def _get_sample_train(self, obfuscated_prior: torch.Tensor, clean_prior: torch.Tensor) -> torch.Tensor:
+    result = torch.randn_like(obfuscated_prior) + obfuscated_prior
     for i in range(self.total_time-1, -1, -1):
         z = torch.randn_like(result) if i > 1 else torch.zeros_like(result)
         sigma = torch.sqrt(self.betas[i])
         model_factor = (1 - self.alphas[i])/torch.sqrt(1-self.alphas_bar[i])
         result = result - model_factor * self._noise_prediction(
-            result, torch.full_like(result[..., [-1]], i).float() / self.total_time
+            result, clean_prior, torch.full_like(result[..., [-1]], i).float() / self.total_time
         )
         result = result / torch.sqrt(self.alphas[i]) + sigma * z
 
     return result
 
 
-  def _get_sample_eval(self, embedding_prior: torch.Tensor) -> torch.Tensor:
+  def _get_sample_eval(self, obfuscated_prior, clean_prior) -> torch.Tensor:
     """Return a batch of samples from the diffusion process.
 
     Args:
@@ -520,13 +529,13 @@ class DiffusionEmbeddingMapper(EmbeddingMapper):
       A batch of samples from the diffusion process.
     """
     with torch.no_grad():
-        result = torch.randn_like(embedding_prior) + embedding_prior
+        result = torch.randn_like(obfuscated_prior) + obfuscated_prior
         for i in range(self.total_time-1, -1, -1):
             z = torch.randn_like(result) if i > 1 else torch.zeros_like(result)
             sigma = torch.sqrt(self.betas[i])
             model_factor = (1 - self.alphas[i])/torch.sqrt(1-self.alphas_bar[i])
             result = result - model_factor * self._noise_prediction(
-                result, torch.full_like(result[..., [-1]], i).float() / self.total_time
+                result, clean_prior, torch.full_like(result[..., [-1]], i).float() / self.total_time
             )
             result = result / torch.sqrt(self.alphas[i]) + sigma * z
 
@@ -561,3 +570,145 @@ class TextWrapper(EmbeddingMapper):
       return *image_outputs, text_outputs
     else:
       return image_outputs
+
+
+class DiffusionRecontrsuctionMapper(EmbeddingMapper):
+  
+  def __init__(self,
+               mlp_sizes: Sequence[int],
+               embed_dim: int,
+               total_time: int = 100,
+               weight_decay: float = 1e-4,
+               num_points: int = 1):
+    super().__init__()
+
+    if len(mlp_sizes) % 2 == 0:
+      raise ValueError(
+          'In this case, mlp_sizes must be a list of odd length. The first half'
+          'of the list corresponds to the encoder part of the diffusion process'
+          'while the second part corresponds to the decoder part. The middle'
+          'element corresponds to the latent dimension.'
+      )
+
+    num_layers_encoder = len(mlp_sizes) // 2
+    encoder_mlp_sizes = mlp_sizes[:num_layers_encoder]
+    latent_dim = mlp_sizes[num_layers_encoder]
+    decoder_mlp_sizes = mlp_sizes[num_layers_encoder+1:]
+
+    self.encoder = MLPEmbeddingMapper(
+        embed_dim,
+        latent_dim,
+        encoder_mlp_sizes,
+        weight_decay,
+        final_activation=None
+    )
+
+    self.encoder_prior = MLPEmbeddingMapper(
+        embed_dim,
+        latent_dim,
+        encoder_mlp_sizes,
+        weight_decay,
+        final_activation=None
+    )
+
+    self.decoder = MLPEmbeddingMapper(
+        2*latent_dim+1,
+        embed_dim,
+        decoder_mlp_sizes,
+        weight_decay,
+        final_activation=None
+    )
+
+    self.total_time = total_time
+    self.num_points = num_points
+
+    # Below definitions are used as in https://arxiv.org/pdf/2006.11239.pdf.
+    self.betas = torch.linspace(1e-4, 2e-2, self.total_time)
+    self.alphas = 1 - self.betas
+    self.alphas_bar = torch.cumprod(self.alphas, dim=0)
+
+    if torch.cuda.is_available():
+        self.betas = self.betas.cuda()
+        self.alphas = self.alphas.cuda()
+        self.alphas_bar = self.alphas_bar.cuda()
+  
+
+  def forward(self, x):
+    return x
+
+  def _get_reconstruction(self, inputs: torch.Tensor, obfuscation_prior: torch.Tensor) -> torch.Tensor:
+
+    multiple_inputs = torch.tile(inputs, (self.num_points, 1))
+    
+    t = torch.randint_like(multiple_inputs[..., [-1]], low=0, high=self.total_time, dtype=torch.int64)
+    noise = torch.randn_like(multiple_inputs)
+
+    chosen_alphas_bar = torch.gather(self.alphas_bar, 0, t.view(-1))
+
+    noisy_image_1 = multiple_inputs * torch.sqrt(chosen_alphas_bar).unsqueeze(1)
+    
+    noisy_image_2 = noise * torch.sqrt(1 - chosen_alphas_bar).unsqueeze(1)
+    
+    noisy_image = noisy_image_1 + noisy_image_2
+
+    return (noisy_image - self._noise_prediction(noisy_image, obfuscation_prior, t.float() / self.total_time))
+
+
+  def _noise_prediction(self, inputs: torch.Tensor, obfuscation_prior: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Predict the noise to add to the input at a given timestep.
+
+    Args:
+      inputs: The input to add noise to.
+      t: The tensor containing the timesteps for the predictions of this batch.
+
+    Returns:
+      The noise prediction for the input at the given timestep.
+    """
+    x1 = self.encoder(inputs)
+    x2 = self.encoder_prior(obfuscation_prior)
+    x = torch.cat([x1, x2, t], dim=-1)
+    x = self.decoder(x)
+    return x
+
+  def get_sample(self, obfuscated_prior: torch.Tensor, training: bool = False) -> torch.Tensor:
+    if training:
+      return self._get_sample_train(obfuscated_prior)
+    else:
+      return self._get_sample_eval(obfuscated_prior)
+
+
+  def _get_sample_train(self, obfuscated_prior: torch.Tensor) -> torch.Tensor:
+    result = torch.randn_like(obfuscated_prior)
+    for i in range(self.total_time-1, -1, -1):
+        z = torch.randn_like(result) if i > 1 else torch.zeros_like(result)
+        sigma = torch.sqrt(self.betas[i])
+        model_factor = (1 - self.alphas[i])/torch.sqrt(1-self.alphas_bar[i])
+        result = result - model_factor * self._noise_prediction(
+            result, obfuscated_prior, torch.full_like(result[..., [-1]], i).float() / self.total_time
+        )
+        result = result / torch.sqrt(self.alphas[i]) + sigma * z
+
+    return result
+
+
+  def _get_sample_eval(self, obfuscated_prior: torch.Tensor) -> torch.Tensor:
+    """Return a batch of samples from the diffusion process.
+
+    Args:
+      embedding_prior: Embeddings on which to condition generation.
+
+    Returns:
+      A batch of samples from the diffusion process.
+    """
+    with torch.no_grad():
+        result = torch.randn_like(obfuscated_prior)
+        for i in range(self.total_time-1, -1, -1):
+            z = torch.randn_like(result) if i > 1 else torch.zeros_like(result)
+            sigma = torch.sqrt(self.betas[i])
+            model_factor = (1 - self.alphas[i])/torch.sqrt(1-self.alphas_bar[i])
+            result = result - model_factor * self._noise_prediction(
+                result, obfuscated_prior, torch.full_like(result[..., [-1]], i).float() / self.total_time
+            )
+            result = result / torch.sqrt(self.alphas[i]) + sigma * z
+
+    return result
